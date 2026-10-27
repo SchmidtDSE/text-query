@@ -56,12 +56,16 @@ CACHE_SIZE = 200_000
 def connect():
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
+    # S3_ENDPOINT may carry a scheme: an in-cluster http:// service turns TLS off.
     endpoint = os.environ.get("S3_ENDPOINT", "s3-west.nrp-nautilus.io")
+    use_ssl = not endpoint.startswith("http://")
+    endpoint = endpoint.split("://")[-1].rstrip("/")
     if os.environ.get("S3_KEY"):
-        con.execute("CREATE SECRET (TYPE s3, KEY_ID ?, SECRET ?, ENDPOINT ?, URL_STYLE 'path')",
-                    [os.environ["S3_KEY"], os.environ["S3_SECRET"], endpoint])
+        con.execute("CREATE SECRET (TYPE s3, KEY_ID ?, SECRET ?, ENDPOINT ?, USE_SSL ?, URL_STYLE 'path')",
+                    [os.environ["S3_KEY"], os.environ["S3_SECRET"], endpoint, use_ssl])
     else:
-        con.execute("CREATE SECRET (TYPE s3, PROVIDER config, ENDPOINT ?, URL_STYLE 'path')", [endpoint])
+        con.execute("CREATE SECRET (TYPE s3, PROVIDER config, ENDPOINT ?, USE_SSL ?, URL_STYLE 'path')",
+                    [endpoint, use_ssl])
     return con
 
 
