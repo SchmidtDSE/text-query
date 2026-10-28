@@ -18,6 +18,7 @@ at passages and check its SQL.
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from collections import OrderedDict
@@ -49,6 +50,23 @@ mcp = FastMCP("text-query", instructions=INSTRUCTIONS, stateless_http=True,
 
 # Answers are cached by model, question and text, so repeated questions cost nothing and
 # return the same answer.
+log = logging.getLogger("text-query")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def logged(tool, sql, fn):
+    """Run a tool body, logging its SQL and any error so failed calls can be diagnosed."""
+    log.info("%s sql=%s", tool, " ".join(sql.split())[:1000])
+    try:
+        out = fn()
+    except Exception as e:
+        log.warning("%s failed: %s: %s", tool, type(e).__name__, e)
+        raise
+    if out.startswith('{"error"'):
+        log.warning("%s refused: %s", tool, out[:300])
+    return out
+
+
 CACHE: OrderedDict = OrderedDict()
 CACHE_SIZE = 200_000
 
@@ -222,8 +240,8 @@ async def decide(sql: str, questions: dict, text_column: str = "text", context_c
     max_return: the most rows to return.
     include_text: return each row's text, truncated to 600 characters, to quote evidence.
     """
-    return await anyio.to_thread.run_sync(
-        lambda: _decide(sql, questions, text_column, context_column, return_rows, max_return, include_text))
+    return await anyio.to_thread.run_sync(lambda: logged("decide", sql, lambda:
+        _decide(sql, questions, text_column, context_column, return_rows, max_return, include_text)))
 
 
 @mcp.tool()
@@ -235,7 +253,7 @@ async def read_rows(sql: str, max_rows: int = 20) -> str:
         out = [{c: (v[:500] + "…" if isinstance(v, str) and len(v) > 500 else v) for c, v in zip(cols, r)}
                for r in rows[:min(max_rows, 50)]]
         return json.dumps({"columns": cols, "rows": out, "truncated": len(rows) > min(max_rows, 50)}, default=str)
-    return await anyio.to_thread.run_sync(run)
+    return await anyio.to_thread.run_sync(lambda: logged("read_rows", sql, run))
 
 
 class BearerAuth(BaseHTTPMiddleware):
