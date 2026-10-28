@@ -7,7 +7,11 @@ hard-wired to one corpus or one model:
   DECISION_MODEL                 optional model name, e.g. ~typesafe/jev-latest
   S3_ENDPOINT, S3_KEY, S3_SECRET optional; without keys DuckDB reads public buckets only
   MCP_AUTH_TOKEN                 optional bearer token for callers
-  INSTRUCTIONS_FILE              optional markdown describing the corpora, sent to clients
+  INSTRUCTIONS_FILE              optional markdown describing the corpora; sent as the server's
+                                 instructions and appended to each tool's description, since
+                                 some clients (geo-agent) show the model only tool descriptions
+  TABLES                         optional views, "name=s3://path.parquet;name2=..."; every query
+                                 can then use the short names
   MAX_ROWS, WORKERS              rows per call and parallel requests
 
 Two tools: `decide` runs typed questions (noul, choice, score) over the text column of a
@@ -39,6 +43,8 @@ DECISION_MODEL = os.environ.get("DECISION_MODEL")
 MAX_ROWS = int(os.environ.get("MAX_ROWS", "400"))
 WORKERS = int(os.environ.get("WORKERS", "12"))
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
+TABLES = dict(kv.split("=", 1) for kv in os.environ.get("TABLES", "").split(";") if "=" in kv)
+assert all(n.isidentifier() for n in TABLES), "TABLES names must be plain identifiers"
 
 INSTRUCTIONS = """Runs codebook questions over text with a decision model, and reads rows of text tables.
 Write DuckDB SQL that returns one row per passage, then call `decide` with typed questions."""
@@ -84,6 +90,8 @@ def connect():
     else:
         con.execute("CREATE SECRET (TYPE s3, PROVIDER config, ENDPOINT ?, USE_SSL ?, URL_STYLE 'path')",
                     [endpoint, use_ssl])
+    for name, path in TABLES.items():
+        con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{path}')")
     return con
 
 
@@ -254,6 +262,12 @@ async def read_rows(sql: str, max_rows: int = 20) -> str:
                for r in rows[:min(max_rows, 50)]]
         return json.dumps({"columns": cols, "rows": out, "truncated": len(rows) > min(max_rows, 50)}, default=str)
     return await anyio.to_thread.run_sync(lambda: logged("read_rows", sql, run))
+
+
+# Clients that ignore server instructions still see tool descriptions, so the corpus
+# description travels with each tool.
+for _tool in mcp._tool_manager.list_tools():
+    _tool.description = f"{_tool.description}\n\n{INSTRUCTIONS}"
 
 
 class BearerAuth(BaseHTTPMiddleware):
