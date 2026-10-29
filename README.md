@@ -7,9 +7,9 @@ A codebook is a set of typed questions (yes/no, choice from labels, or a level o
 scale), and the answers are probabilities that become columns of a new dataset.
 
 **Status:** design. A pilot version of the batch coder is in
-[`corpus-workflows/pilot`](https://github.com/SchmidtDSE/corpus-workflows/tree/main/pilot). The
+[`text-workflows/pilot`](https://github.com/SchmidtDSE/text-workflows/tree/main/pilot). The
 design is in
-[`corpus-workflows/PLAN.md`](https://github.com/SchmidtDSE/corpus-workflows/blob/main/PLAN.md).
+[`text-workflows/PLAN.md`](https://github.com/SchmidtDSE/text-workflows/blob/main/PLAN.md).
 
 ## Front ends
 
