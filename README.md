@@ -6,9 +6,10 @@ renamed `geo-query`) is to tables: generic, open by default, and usable by agent
 A codebook is a set of typed questions (yes/no, choice from labels, or a level on an ordered
 scale), and the answers are probabilities that become columns of a new dataset.
 
-**Status:** design. A pilot version of the batch coder is in
-[`text-workflows/pilot`](https://github.com/SchmidtDSE/text-workflows/tree/main/pilot). The
-design is in
+**Status:** prototype. `prototype/` is a single-file MCP server with `decide` and `read_rows`
+that the private High Seas app runs today; see its README. A pilot version of the batch coder
+is in [`text-workflows/pilot`](https://github.com/SchmidtDSE/text-workflows/tree/main/pilot).
+The design is in
 [`text-workflows/PLAN.md`](https://github.com/SchmidtDSE/text-workflows/blob/main/PLAN.md).
 
 ## Front ends
@@ -39,8 +40,9 @@ supplied per request.
 
 - **Decision model:** any service that accepts the Jev request body (`state` plus named
   `noul`, `choice` and `score` questions) and returns probabilities. Jev on OpenRouter
-  (`https://openrouter.ai/api/v1/systemone`) and Laya are both of this kind. In the pilot Jev
-  was much more accurate; Laya is free and useful as a comparison.
+  (`https://openrouter.ai/api/v1/systemone`), Kev and Laya are all of this kind. Jev is the
+  default; Kev is a free option where speed does not matter (see the pilot results in
+  `PLAN.md`).
 - **Extraction model:** any OpenAI-compatible chat endpoint with structured output.
 - **Embedding model, if used:** any OpenAI-compatible embeddings endpoint.
 
