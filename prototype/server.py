@@ -24,7 +24,9 @@ import hmac
 import json
 import logging
 import os
+import tempfile
 import time
+import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -79,7 +81,14 @@ CACHE_SIZE = 200_000
 
 def connect():
     con = duckdb.connect()
+    # Before any secret, so DuckDB never opens ~/.duckdb/stored_secrets, which
+    # the lock below would refuse.
+    con.execute("SET allow_persistent_secrets=false")
     con.execute("INSTALL httpfs; LOAD httpfs;")
+    # A private spill directory per connection; DuckDB creates it on first spill
+    # and removes it on close.
+    temp_dir = os.path.join(tempfile.gettempdir(), f"duckdb-{uuid.uuid4().hex}")
+    con.execute(f"SET temp_directory='{temp_dir}'")
     # S3_ENDPOINT may carry a scheme: an in-cluster http:// service turns TLS off.
     endpoint = os.environ.get("S3_ENDPOINT", "s3-west.nrp-nautilus.io")
     use_ssl = not endpoint.startswith("http://")
@@ -92,7 +101,29 @@ def connect():
                     [endpoint, use_ssl])
     for name, path in TABLES.items():
         con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{path}')")
+    lock_down(con, temp_dir)
     return con
+
+
+def lock_down(con, temp_dir):
+    """Limit caller SQL to remote data, the TABLES files and the spill directory,
+    then freeze the configuration, using DuckDB's own settings.
+
+    After this, local paths other than those, plain http:// URLs, ATTACH,
+    INSTALL and every SET/RESET/PRAGMA are refused. s3:// reads still go to the
+    endpoint in the S3 secret, including an in-cluster http:// endpoint.
+    """
+    allowed = ["s3://", "https://", temp_dir.rstrip("/") + "/"]
+    for path in TABLES.values():  # local TABLES files, e.g. in development
+        if "://" not in path:
+            allowed.append(os.path.dirname(os.path.abspath(path)).rstrip("/") + "/")
+    quoted = ", ".join("'" + a.replace("'", "''") + "'" for a in allowed)
+    con.execute("SET autoinstall_known_extensions=false")
+    con.execute("SET autoload_known_extensions=false")
+    con.execute("SET allow_community_extensions=false")
+    con.execute(f"SET allowed_directories=[{quoted}]")
+    con.execute("SET enable_external_access=false")
+    con.execute("SET lock_configuration=true")
 
 
 def run_sql(sql, limit):
