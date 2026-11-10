@@ -6,7 +6,12 @@ hard-wired to one corpus or one model:
   DECISION_URL, DECISION_TOKEN   any Jev-compatible endpoint, e.g. https://openrouter.ai/api/v1/systemone
   DECISION_MODEL                 optional model name, e.g. ~typesafe/jev-latest
   S3_ENDPOINT, S3_KEY, S3_SECRET optional; without keys DuckDB reads public buckets only
-  MCP_AUTH_TOKEN                 optional bearer token for callers
+  MCP_AUTH_TOKENS_DIR            directory of caller tokens, one file per caller named for it
+                                 (a mounted Kubernetes Secret); every path but /health needs one
+  MCP_AUTH_TOKEN                 the older single token, named "default"
+  POD_MEMORY_LIMIT, POD_EPHEMERAL_LIMIT
+                                 the pod's limits (Downward API), which bound DuckDB's memory
+                                 and spill; see dbconfig.py
   INSTRUCTIONS_FILE              optional markdown describing the corpora; sent as the server's
                                  instructions and appended to each tool's description, since
                                  some clients (geo-agent) show the model only tool descriptions
@@ -17,16 +22,18 @@ hard-wired to one corpus or one model:
 Two tools: `decide` runs typed questions (noul, choice, score) over the text column of a
 query's rows; `read_rows` returns a few rows, with long text truncated, so an agent can look
 at passages and check its SQL.
+
+Caller SQL runs on a locked DuckDB connection (dbconfig.py): one SELECT statement, reading only
+s3:// and https://, with no way to change settings, create secrets or write. Credentials never
+appear in results or errors.
 """
 
 import hashlib
-import hmac
 import json
 import logging
 import os
-import tempfile
+import sys
 import time
-import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -39,14 +46,23 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
+from auth import CALLER, load_tokens, match_token
+from dbconfig import LOCKED_HINT, check_select, lock_down, redact, setup_sql, sql_quote
+
 DECISION_URL = os.environ["DECISION_URL"].rstrip("/")
 DECISION_TOKEN = os.environ.get("DECISION_TOKEN", "")
 DECISION_MODEL = os.environ.get("DECISION_MODEL")
 MAX_ROWS = int(os.environ.get("MAX_ROWS", "400"))
 WORKERS = int(os.environ.get("WORKERS", "12"))
-AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
+TOKENS_DIR = os.environ.get("MCP_AUTH_TOKENS_DIR", "").strip()
+DIR_TOKENS = load_tokens(TOKENS_DIR)
+TOKENS = load_tokens(TOKENS_DIR, os.environ.get("MCP_AUTH_TOKEN", ""))
 TABLES = dict(kv.split("=", 1) for kv in os.environ.get("TABLES", "").split(";") if "=" in kv)
 assert all(n.isidentifier() for n in TABLES), "TABLES names must be plain identifiers"
+# Directories of local TABLES files (in development), which the lock must admit.
+LOCAL_TABLE_DIRS = sorted({os.path.dirname(os.path.abspath(p)) for p in TABLES.values() if "://" not in p})
+# Values scrubbed from anything returned to a caller.
+CREDENTIALS = [os.environ.get(k, "") for k in ("S3_KEY", "S3_SECRET", "DECISION_TOKEN")]
 
 INSTRUCTIONS = """Runs codebook questions over text with a decision model, and reads rows of text tables.
 Write DuckDB SQL that returns one row per passage, then call `decide` with typed questions."""
@@ -62,16 +78,22 @@ log = logging.getLogger("text-query")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
-def logged(tool, sql, fn):
-    """Run a tool body, logging its SQL and any error so failed calls can be diagnosed."""
-    log.info("%s sql=%s", tool, " ".join(sql.split())[:1000])
+def logged(tool, sql, fn, caller="-"):
+    """Run a tool body, logging the caller, its SQL and any error so failed calls can be
+    diagnosed. Errors go back to the caller with credentials redacted and, for a refused
+    setting change, a hint."""
+    log.info("%s [%s] sql=%s", tool, caller, " ".join(sql.split())[:1000])
     try:
         out = fn()
     except Exception as e:
-        log.warning("%s failed: %s: %s", tool, type(e).__name__, e)
-        raise
+        msg = redact(str(e), CREDENTIALS)
+        log.warning("%s [%s] failed: %s: %s", tool, caller, type(e).__name__, msg)
+        if "configuration has been locked" in msg or "Permission Error" in msg and "extension" in msg:
+            msg = f"{msg}\n\n{LOCKED_HINT}"
+        raise RuntimeError(msg) from None
+    out = redact(out, CREDENTIALS)
     if out.startswith('{"error"'):
-        log.warning("%s refused: %s", tool, out[:300])
+        log.warning("%s [%s] refused: %s", tool, caller, out[:300])
     return out
 
 
@@ -80,15 +102,16 @@ CACHE_SIZE = 200_000
 
 
 def connect():
+    """A fresh connection with the deployment's secret and views, locked (dbconfig.py)."""
     con = duckdb.connect()
-    # Before any secret, so DuckDB never opens ~/.duckdb/stored_secrets, which
-    # the lock below would refuse.
-    con.execute("SET allow_persistent_secrets=false")
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    # A private spill directory per connection; DuckDB creates it on first spill
-    # and removes it on close.
-    temp_dir = os.path.join(tempfile.gettempdir(), f"duckdb-{uuid.uuid4().hex}")
-    con.execute(f"SET temp_directory='{temp_dir}'")
+    for stmt in setup_sql():
+        con.execute(stmt)
+    try:
+        con.execute("LOAD httpfs")
+    except duckdb.Error:
+        # The image installs httpfs at build time; a local run installs it once here.
+        con.execute("INSTALL httpfs; LOAD httpfs")
+    con.execute("LOAD json")  # json_serialize_sql, for the SELECT check
     # S3_ENDPOINT may carry a scheme: an in-cluster http:// service turns TLS off.
     endpoint = os.environ.get("S3_ENDPOINT", "s3-west.nrp-nautilus.io")
     use_ssl = not endpoint.startswith("http://")
@@ -100,35 +123,15 @@ def connect():
         con.execute("CREATE SECRET (TYPE s3, PROVIDER config, ENDPOINT ?, USE_SSL ?, URL_STYLE 'path')",
                     [endpoint, use_ssl])
     for name, path in TABLES.items():
-        con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{path}')")
-    lock_down(con, temp_dir)
+        con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{sql_quote(path)}')")
+    lock_down(con, LOCAL_TABLE_DIRS)
     return con
-
-
-def lock_down(con, temp_dir):
-    """Limit caller SQL to remote data, the TABLES files and the spill directory,
-    then freeze the configuration, using DuckDB's own settings.
-
-    After this, local paths other than those, plain http:// URLs, ATTACH,
-    INSTALL and every SET/RESET/PRAGMA are refused. s3:// reads still go to the
-    endpoint in the S3 secret, including an in-cluster http:// endpoint.
-    """
-    allowed = ["s3://", "https://", temp_dir.rstrip("/") + "/"]
-    for path in TABLES.values():  # local TABLES files, e.g. in development
-        if "://" not in path:
-            allowed.append(os.path.dirname(os.path.abspath(path)).rstrip("/") + "/")
-    quoted = ", ".join("'" + a.replace("'", "''") + "'" for a in allowed)
-    con.execute("SET autoinstall_known_extensions=false")
-    con.execute("SET autoload_known_extensions=false")
-    con.execute("SET allow_community_extensions=false")
-    con.execute(f"SET allowed_directories=[{quoted}]")
-    con.execute("SET enable_external_access=false")
-    con.execute("SET lock_configuration=true")
 
 
 def run_sql(sql, limit):
     con = connect()
     try:
+        check_select(con, sql)
         rel = con.sql(sql)
         cols = rel.columns
         rows = rel.limit(limit + 1).fetchall()
@@ -279,8 +282,9 @@ async def decide(sql: str, questions: dict, text_column: str = "text", context_c
     max_return: the most rows to return.
     include_text: return each row's text, truncated to 600 characters, to quote evidence.
     """
+    caller = CALLER.get()
     return await anyio.to_thread.run_sync(lambda: logged("decide", sql, lambda:
-        _decide(sql, questions, text_column, context_column, return_rows, max_return, include_text)))
+        _decide(sql, questions, text_column, context_column, return_rows, max_return, include_text), caller))
 
 
 @mcp.tool()
@@ -292,7 +296,8 @@ async def read_rows(sql: str, max_rows: int = 20) -> str:
         out = [{c: (v[:500] + "…" if isinstance(v, str) and len(v) > 500 else v) for c, v in zip(cols, r)}
                for r in rows[:min(max_rows, 50)]]
         return json.dumps({"columns": cols, "rows": out, "truncated": len(rows) > min(max_rows, 50)}, default=str)
-    return await anyio.to_thread.run_sync(lambda: logged("read_rows", sql, run))
+    caller = CALLER.get()
+    return await anyio.to_thread.run_sync(lambda: logged("read_rows", sql, run, caller))
 
 
 # Clients that ignore server instructions still see tool descriptions, so the corpus
@@ -302,17 +307,35 @@ for _tool in mcp._tool_manager.list_tools():
 
 
 class BearerAuth(BaseHTTPMiddleware):
+    """Health checks pass; with tokens configured every other path needs one of them, and the
+    matched token's name (never the token) goes on the log lines as the caller."""
+
     async def dispatch(self, request, call_next):
-        if request.url.path == "/health":
+        if request.url.path in ("/health", "/healthz"):
             return JSONResponse({"status": "ok"})
-        if AUTH_TOKEN:
-            got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-            if not hmac.compare_digest(got, AUTH_TOKEN):
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return await call_next(request)
+        if not TOKENS:
+            return await call_next(request)
+        auth = request.headers.get("authorization", "")
+        caller = match_token(auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else "", TOKENS)
+        if caller is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        reset = CALLER.set(caller)
+        try:
+            return await call_next(request)
+        finally:
+            CALLER.reset(reset)
+
+
+def app():
+    if TOKENS_DIR and not DIR_TOKENS:
+        # Fail closed: a configured but empty or unreadable token directory must not start a
+        # server without auth.
+        sys.exit("MCP_AUTH_TOKENS_DIR is set but no tokens were loaded; refusing to start without auth.")
+    log.info("auth: %s", f"{len(TOKENS)} token(s) ({', '.join(sorted(TOKENS))})" if TOKENS else "off")
+    a = mcp.streamable_http_app()
+    a.add_middleware(BearerAuth)
+    return a
 
 
 if __name__ == "__main__":
-    app = mcp.streamable_http_app()
-    app.add_middleware(BearerAuth)
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+    uvicorn.run(app(), host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
