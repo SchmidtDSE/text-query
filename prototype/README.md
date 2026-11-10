@@ -1,6 +1,6 @@
 # Prototype server
 
-A single-file MCP server with two tools, built to demo codebook questions over a literature
+An MCP server with two tools, built to demo codebook questions over a literature
 corpus in the High Seas app. It stands in for the design in the top-level README until the
 library and batch front end exist.
 
@@ -40,8 +40,8 @@ NRP incident of 2026-11-06, plus one rule geo-query lacks.
   filesystem. CI builds `ghcr.io/schmidtdse/text-query` on every push to `main`.
 
 The deployment adds the rest: no service-account token, no Ingress, and a NetworkPolicy that
-admits only the app's pods and lets the server reach only DNS, its object store and public
-https (the decision model).
+admits only the app's pods and lets the server reach only DNS and public https. The
+top-level README's Deployment section lists what a deployment needs.
 
 ```bash
 pip install -r requirements.txt pytest httpx && python -m pytest tests
