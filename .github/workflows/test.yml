@@ -17,4 +17,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r prototype/requirements.txt pytest httpx
+      # As the image does: the server and tests load httpfs, and lock_down forbids installing it later.
+      - run: python -c "import duckdb; duckdb.connect().sql('INSTALL httpfs')"
       - run: python -m pytest -q prototype/tests
